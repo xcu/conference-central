@@ -59,8 +59,6 @@ CONFERENCE_DEFAULTS = {
     "maxAttendees": 0,
     "seatsAvailable": 0,
     "topics": [ "Default", "Topic" ],
-    "sessionIds": [],
-    "featuredSpeaker": "",
 }
 
 SESSION_DEFAULTS = {
@@ -107,7 +105,7 @@ CONF_POST_REQUEST = endpoints.ResourceContainer(
 
 SESSION_GET_REQUEST = endpoints.ResourceContainer(
     message_types.VoidMessage,
-    websafeSessionKey=messages.StringField(1),
+    websafeKey=messages.StringField(1),
 )
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
@@ -234,40 +232,27 @@ class ConferenceApi(remote.Service):
         s_id = Session.allocate_ids(size=1, parent=c_key)[0]
         s_key = ndb.Key(Session, s_id, parent=c_key)
         data['key'] = s_key
-        # in terms of computational cost this is the best time to calculate
-        # the featured speaker, as we don't need to calculate which is the
-        # newest session
-        featuredSpeaker = None
+
+        conference = ndb.Key(urlsafe=request.conferenceId).get()
         user_profile = self._getProfileFromUser()
-        if user_profile.mainEmail != request.speakerUserId:
+        if user_profile.mainEmail != conference.organizerUserId:
             raise endpoints.InternalServerErrorException(
-                "Speaker email must match authorized user")
-        if self._isNewFeaturedSpeaker(user_profile,
-                                      request.conferenceId):
-            featuredSpeaker = getUserId(self._get_user())
-        self._do_create_session(
-            data, s_key.urlsafe(), ndb.Key(urlsafe=request.conferenceId).get(),
-            featuredSpeaker=featuredSpeaker
+                "Only conference creator can add sessions")
+
+        taskqueue.add(params={
+            'speaker_email': request.speakerUserId,
+            'conference_id': request.conferenceId
+            },
+            url='/tasks/update_featured_speaker'
         )
+
+        self._do_create_session(data, request.conferenceId)
         return request
 
-    def _isNewFeaturedSpeaker(self, profile, conferenceId):
-        # this method is supposed to be called during a session creation, just
-        # before persisting the data. This way the code in the transaction
-        # _do_create_session does not get too big.
-        # 1- get sessions from a particular profile in that conference
-        # 2- If it has at least one, set as new featured speaker (added to the
-        # session which is about to be created it will have at least two)
-        if len(self._sessionsAsSpeaker(conferenceId, profile)) >= 1:
-            return True
-        return False
-
     @ndb.transactional()
-    def _do_create_session(self, session_data, session_id, conference,
-                           featuredSpeaker=None):
-        conference.sessionIds.append(str(session_id))
-        if featuredSpeaker:
-            conference.featuredSpeaker = featuredSpeaker
+    def _do_create_session(self, session_data, conferenceId):
+        # change from review: fetch the conference object INSIDE the transaction
+        conference = ndb.Key(urlsafe=conferenceId).get()
         conference.put()
         Session(**session_data).put()
 
@@ -523,6 +508,19 @@ class ConferenceApi(remote.Service):
 
         return announcement
 
+    @staticmethod
+    def _featuredSpeakerAnnouncement(email):
+        key = 'FEATURED SPEAKER'
+        announcement = "Conference featured speaker: {0}".format(email)
+        memcache.set(key, announcement)
+        return announcement
+
+    @endpoints.method(message_types.VoidMessage, StringMessage,
+            path='conference/featuredSpeaker',
+            http_method='GET', name='getFeaturedSpeaker')
+    def getFeaturedSpeaker(self, request):
+        return StringMessage(data=memcache.get("FEATURED SPEAKER") or "")
+
 
     @endpoints.method(message_types.VoidMessage, StringMessage,
             path='conference/announcement/get',
@@ -531,6 +529,25 @@ class ConferenceApi(remote.Service):
         """Return Announcement from memcache."""
         return StringMessage(data=memcache.get(MEMCACHE_ANNOUNCEMENTS_KEY) or "")
 
+    @staticmethod
+    def _isNewFeaturedSpeaker(userEmail, conferenceId):
+        # this method is supposed to be called during a session creation, just
+        # before persisting the data.
+        # 1- get sessions from a particular profile in that conference
+        # 2- If it has at least one, set as new featured speaker (added to the
+        # session which is about to be created it will have at least two)
+        if len(ConferenceApi._sessionsAsSpeaker(conferenceId, userEmail)) >= 1:
+            return True
+        return False
+
+    @staticmethod
+    def _sessionsAsSpeaker(websafeConferenceKey, userEmail):
+        # returns in which sessions the user has been a speaker for that conf
+        # changed after code review
+        q = Session.query()
+        q = q.filter(Session.conferenceId == websafeConferenceKey)
+        q = q.filter(Session.speakerUserId == userEmail)
+        return [s for s in q]
 
 # - - - Registration - - - - - - - - - - - - - - - - - - - -
 
@@ -649,18 +666,14 @@ class ConferenceApi(remote.Service):
             raise endpoints.NotFoundException(
                 'No conference found with key: %s' % urlsafeKey)
 
-    def _sessionsInConference(self, websafeConferenceKey):
-        # returns a list with the sessions of that conference
-        conference = self._getConference(websafeConferenceKey)
-        return [ndb.Key(urlsafe=k).get() for k in conference.sessionIds]
-
     @endpoints.method(CONF_GET_REQUEST, SessionForms,
             path='conference/{websafeConferenceKey}/sessions',
             http_method='GET', name='getConferenceSessions')
     def getConferenceSessions(self, request):
         """ Given a conference, return all its sessions """
-        return SessionForms(items=[self._copySessionToForm(s) for s in
-            self._sessionsInConference(request.websafeConferenceKey)])
+        q = Session.query()
+        q = q.filter(Session.conferenceId == request.websafeConferenceKey)
+        return SessionForms(items=[self._copySessionToForm(s) for s in q])
 
     @endpoints.method(CONF_TYPE_GET_REQUEST, SessionForms,
             path='conference/{websafeConferenceKey}/sessionsByType/{sessionType}',
@@ -676,16 +689,15 @@ class ConferenceApi(remote.Service):
         q = q.filter(Session.typeOfSession == TypeOfSession(session_type))
         return SessionForms(items=[self._copySessionToForm(s) for s in q])
 
-    @endpoints.method(message_types.VoidMessage, SessionForms,
-            path='profile/getSessions',
+    @endpoints.method(SESSION_GET_REQUEST, SessionForms,
+            path='session/speaker/{websafeKey}',
             http_method='GET', name='getSessionsBySpeaker')
     def getSessionsBySpeaker(self, request):
         """ Given a speaker, return all sessions given by this particular
         speaker, across all conferences """
-
+        # changed after code review
         q = Session.query()
-        profile = self._getProfileFromUser()
-        q = q.filter(Session.speakerUserId == profile.key.id())
+        q = q.filter(Session.speakerUserId == request.websafeKey)
         return SessionForms(items=[self._copySessionToForm(s) for s in q])
 
     @endpoints.method(SessionForm, SessionForm, path='session',
@@ -693,21 +705,21 @@ class ConferenceApi(remote.Service):
     def createSession(self, sessionForm):
         return self._createSessionObject(sessionForm)
 
-    def _sessionsAsSpeaker(self, websafeConferenceKey, profile):
-        # returns in which sessions the user has been a speaker for that conf
-        sessions = self._sessionsInConference(websafeConferenceKey)
-        return [s for s in sessions if s.speakerUserId == profile.key.id()]
-
     @endpoints.method(SESSION_GET_REQUEST, SessionForm,
-            path='profile/wishlist/{websafeSessionKey}',
+            path='profile/wishlist/{websafeKey}',
             http_method='POST', name='addSessionToWishlist')
+    @ndb.transactional()
     def addSessionToWishlist(self, request):
         """ Adds a session to the user wishlist """
-        key = request.websafeSessionKey
+        key = request.websafeKey
         profile = self._getProfileFromUser()
         if not getattr(profile, 'sessionWishList', None):
             profile.sessionWishlist = [key]
         else:
+            # Changed after code review: check if it is a duplicate
+            if key in profile.sessionWishlist:
+                # no need to return an error, just return the existing one
+                return self._copySessionToForm(ndb.Key(urlsafe=key).get())
             profile.sessionWishlist.append(key)
         profile.put()
         return self._copySessionToForm(ndb.Key(urlsafe=key).get())
@@ -719,7 +731,8 @@ class ConferenceApi(remote.Service):
         """ Returns the user wishlist for a specific conference """
         conferenceId = request.websafeConferenceKey
         profile = self._getProfileFromUser()
-        sessions = [ndb.Key(urlsafe=s).get() for s in profile.sessionWishlist]
+        # changed after code review
+        sessions = ndb.get_multi([ndb.Key(urlsafe=s) for s in profile.sessionWishlist])
         return SessionForms(items=[self._copySessionToForm(s) for s in sessions
                                    if s.conferenceId == conferenceId])
 

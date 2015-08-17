@@ -68,8 +68,6 @@ class Conference(ndb.Model):
     endDate         = ndb.DateProperty()
     maxAttendees    = ndb.IntegerProperty()
     seatsAvailable  = ndb.IntegerProperty()
-    sessionIds      = ndb.StringProperty(repeated=True)
-    featuredSpeaker = ndb.StringProperty()
 
 
 class ConferenceForm(messages.Message):
@@ -86,8 +84,6 @@ class ConferenceForm(messages.Message):
     endDate         = messages.StringField(10) #DateTimeField()
     websafeKey      = messages.StringField(11)
     organizerDisplayName = messages.StringField(12)
-    sessionIds      = messages.StringField(13, repeated=True)
-    featuredSpeaker = messages.StringField(14)
 
 
 class ConferenceForms(messages.Message):

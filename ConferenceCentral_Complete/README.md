@@ -27,8 +27,26 @@ App Engine application for the Udacity training course.
 
 > App Architechture
 
-All the implementation attempts to follow the same guidelines provided in the Conference Central app. Regarding the model, most of the fields are straight forward. I added a couple of comments to justify a specific type, but other than that it aims to be self explanatory.
-No class has been added to represent a speaker due to lack of available time, but that addition could have probably solved the restriction mentioned in the getFeaturedSpeaker section.
+All the implementation attempts to follow the same guidelines provided in the Conference Central app.
+No class has been added to represent a speaker due to lack of available time.
+
+> App Model
+
+The **Profile** representation has changed as follows:
+A **SessionWishlist** attribute has been added. This represents a list of unique Session keys that the user has added to his wishlist.
+
+A **TypeOfSession** enum class has been added to represent the different types of sessions in a controlled way.
+
+The **Session** representation has been added as follows:
+ After having a look at the requirements these were the attributes added
+ * **name**: session name
+ * **highlights**: list of session highlights
+ * **speakerUserId**: speaker's email
+ * **duration**: session duration in minutes
+ * **typeOfSession**: enum value (see explanation for TypeOfSession above)
+ * **date**: session's date
+ * **startTime**: session's start time
+ * **conferenceId**: reference to the conference it belongs to. I have been told in the code review that given the conference is the parent object this attribute might be redundant, and it looks like it. I will definitely take it into account for my next app engine project!
 
 > Add Sessions to a Conference
 
@@ -49,8 +67,8 @@ About the query related problem regarding non-workshops after 7pm, it cannot be 
 
 > Define the following endpoints method: getFeaturedSpeaker()
 
-There are probably several approaches to implement this. I preferred to add a new attribute in the Conference kind and calculate it only once, when a new session is created. This way, if we have 1000 users requesting the featured speaker at the same time we will not have to calculate the same thing 1000 times, only to return an attribute that has been calculated already.
-Also, session creation requires the speaker email to be the same as the authorized user, since we need the User.key to fetch the Profile or build a new one. According to app engine docs the User class represents an authorized user, thereby the restriction.
+To implement this feature with a task I created a task that gets run every time a Session is created. This task will check if the new session's speaker is the new featured one. If that's the case a memcache announcement will be modified to set the data accordingly.
+
 
 [1]: https://developers.google.com/appengine
 [2]: http://python.org
